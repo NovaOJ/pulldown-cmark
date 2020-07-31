@@ -74,6 +74,8 @@ pub enum Tag<'a> {
     BlockQuote,
     /// A code block.
     CodeBlock(CodeBlockKind<'a>),
+    /// A math block.
+    MathBlock,
 
     /// A list. If the list is ordered the field indicates the number of the first item.
     /// Contains only list items.
@@ -232,6 +234,7 @@ enum ItemBody {
     Rule,
     Heading(u32), // heading level
     FencedCodeBlock(CowIndex),
+    MathBlock(CowIndex),
     IndentCodeBlock,
     Html,
     BlockQuote,
@@ -466,8 +469,14 @@ impl<'a> FirstPass<'a> {
             return ix + scan_blank_line(&bytes[ix..]).unwrap_or(0);
         }
 
+        // Code Block
         if let Some((n, fence_ch)) = scan_code_fence(&bytes[ix..]) {
             return self.parse_fenced_code_block(ix, indent, fence_ch, n);
+        }
+
+        // Math Block
+        if let Some((n, fence_ch)) = scan_math_fence(&bytes[ix..]) {
+            return self.parse_fenced_math_block(ix, indent, fence_ch, n);
         }
         self.parse_paragraph(ix)
     }
@@ -1063,6 +1072,56 @@ impl<'a> FirstPass<'a> {
             if !close_line_start.scan_space(4) {
                 let close_ix = ix + close_line_start.bytes_scanned();
                 if let Some(n) = scan_closing_code_fence(&bytes[close_ix..], fence_ch, n_fence_char)
+                {
+                    ix = close_ix + n;
+                    break;
+                }
+            }
+            let remaining_space = line_start.remaining_space();
+            ix += line_start.bytes_scanned();
+            let next_ix = ix + scan_nextline(&bytes[ix..]);
+            self.append_code_text(remaining_space, ix, next_ix);
+            ix = next_ix;
+        }
+
+        self.pop(ix);
+
+        // try to read trailing whitespace or it will register as a completely blank line
+        ix + scan_blank_line(&bytes[ix..]).unwrap_or(0)
+    }
+
+    fn parse_fenced_math_block(
+        &mut self,
+        start_ix: usize,
+        indent: usize,
+        fence_ch: u8,
+        n_fence_char: usize,
+    ) -> usize {
+        let bytes = self.text.as_bytes();
+        let mut info_start = start_ix + n_fence_char;
+        info_start += scan_whitespace_no_nl(&bytes[info_start..]);
+        // TODO: info strings are typically very short. wouldnt it be faster
+        // to just do a forward scan here?
+        let mut ix = info_start + scan_nextline(&bytes[info_start..]);
+        let info_end = ix - scan_rev_while(&bytes[info_start..ix], is_ascii_whitespace);
+        let info_string = unescape(&self.text[info_start..info_end]);
+        self.tree.append(Item {
+            start: start_ix,
+            end: 0, // will get set later
+            body: ItemBody::MathBlock(self.allocs.allocate_cow(info_string)),
+        });
+        self.tree.push();
+        loop {
+            let mut line_start = LineStart::new(&bytes[ix..]);
+            let n_containers = scan_containers(&self.tree, &mut line_start);
+            if n_containers < self.tree.spine_len() {
+                break;
+            }
+            line_start.scan_space(indent);
+            let mut close_line_start = line_start.clone();
+            if !close_line_start.scan_space(4) {
+                let close_ix = ix + close_line_start.bytes_scanned();
+                if let Some(n) = scan_closing_math_fence(&bytes[close_ix..], fence_ch, n_fence_char)
                 {
                     ix = close_ix + n;
                     break;
@@ -2863,6 +2922,7 @@ fn item_to_tag<'a>(item: &Item, allocs: &Allocations<'a>) -> Tag<'a> {
         ItemBody::FencedCodeBlock(cow_ix) => {
             Tag::CodeBlock(CodeBlockKind::Fenced(allocs[cow_ix].clone()))
         }
+        ItemBody::MathBlock(_) => Tag::MathBlock,
         ItemBody::IndentCodeBlock => Tag::CodeBlock(CodeBlockKind::Indented),
         ItemBody::BlockQuote => Tag::BlockQuote,
         ItemBody::List(_, c, listitem_start) => {
@@ -2913,6 +2973,7 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &Allocations<'a>) -> Eve
         ItemBody::FencedCodeBlock(cow_ix) => {
             Tag::CodeBlock(CodeBlockKind::Fenced(allocs[cow_ix].clone()))
         }
+        ItemBody::MathBlock(_) => Tag::MathBlock,
         ItemBody::IndentCodeBlock => Tag::CodeBlock(CodeBlockKind::Indented),
         ItemBody::BlockQuote => Tag::BlockQuote,
         ItemBody::List(_, c, listitem_start) => {
@@ -3264,6 +3325,16 @@ mod test {
     fn inline_math_check() {
         let test_str = "hello\n$a_i+a_j$";
         let expected = "<p>hello\n<math>$a_i+a_j$</math></p>\n";
+
+        let mut buf = String::new();
+        crate::html::push_html(&mut buf, Parser::new(test_str));
+        assert_eq!(expected, buf);
+    }
+
+    #[test]
+    fn math_block_check() {
+        let test_str = "$a$\n\n$$\nx = \\frac{-b\\pm\\sqrt{\\Delta}}{2a}\n$$\n\n$b$\n\n**a**";
+        let expected = "<p><math>$a$</math></p>\n<math>$$\nx = \\frac{-b\\pm\\sqrt{\\Delta}}{2a}\n$$</math>\n<p><math>$b$</math></p>\n<p><strong>a</strong></p>\n";
 
         let mut buf = String::new();
         crate::html::push_html(&mut buf, Parser::new(test_str));

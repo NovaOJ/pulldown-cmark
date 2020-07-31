@@ -273,6 +273,12 @@ where
                     CodeBlockKind::Indented => self.write("<pre><code>"),
                 }
             }
+            Tag::MathBlock => {
+                if !self.end_newline {
+                    self.write_newline()?;
+                }
+                self.write("<math>$$\n")
+            }
             Tag::List(Some(1)) => {
                 if self.end_newline {
                     self.write("<ol>\n")
@@ -387,6 +393,9 @@ where
             }
             Tag::CodeBlock(_) => {
                 self.write("</code></pre>\n")?;
+            }
+            Tag::MathBlock => {
+                self.write("$$</math>\n")?;
             }
             Tag::List(Some(_)) => {
                 self.write("</ol>\n")?;

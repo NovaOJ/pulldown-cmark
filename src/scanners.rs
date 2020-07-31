@@ -605,6 +605,52 @@ pub(crate) fn scan_code_fence(data: &[u8]) -> Option<(usize, u8)> {
     }
 }
 
+pub(crate) fn scan_closing_math_fence(
+    bytes: &[u8],
+    fence_char: u8,
+    n_fence_char: usize,
+) -> Option<usize> {
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let mut i = 0;
+    let num_fence_chars_found = scan_ch_repeat(&bytes[i..], fence_char);
+    if num_fence_chars_found < n_fence_char {
+        return None;
+    }
+    i += num_fence_chars_found;
+    let num_trailing_spaces = scan_ch_repeat(&bytes[i..], b' ');
+    i += num_trailing_spaces;
+    scan_eol(&bytes[i..]).map(|_| i)
+}
+
+/// Scan math fence.
+///
+/// Returns number of bytes scanned and the char that is repeated to make the code fence.
+pub(crate) fn scan_math_fence(data: &[u8]) -> Option<(usize, u8)> {
+    let c = *data.get(0)?;
+    if !(c == b'$') {
+        return None;
+    }
+    let i = 1 + scan_ch_repeat(&data[1..], c);
+    if i == 2 {
+        if c == b'$' {
+            let suffix = &data[i..];
+            let next_line = i + scan_nextline(suffix);
+            // FIXME: make sure this is correct
+            if suffix[..(next_line - i)]
+                .iter()
+                .any(|&b| (b != b'\n' && b != b'\t'))
+            {
+                return None;
+            }
+        }
+        Some((i, c))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn scan_blockquote_start(data: &[u8]) -> Option<usize> {
     if data.starts_with(b"> ") {
         Some(2)
