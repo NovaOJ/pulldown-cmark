@@ -154,6 +154,8 @@ pub enum Event<'a> {
     Text(CowStr<'a>),
     /// An inline code node.
     Code(CowStr<'a>),
+    /// An inline math node.
+    Math(CowStr<'a>),
     /// An HTML node.
     Html(CowStr<'a>),
     /// A reference to a footnote with given label, which may or may not be defined
@@ -211,6 +213,7 @@ enum ItemBody {
     MaybeEmphasis(usize, bool, bool),
     MaybeCode(usize, bool), // number of backticks, preceeded by backslash
     MaybeHtml,
+    MaybeMath(usize, bool),
     MaybeLinkOpen,
     MaybeLinkClose,
     MaybeImage,
@@ -220,6 +223,7 @@ enum ItemBody {
     Strong,
     Strikethrough,
     Code(CowIndex),
+    Math(CowIndex),
     Link(LinkIndex),
     Image(LinkIndex),
     FootnoteReference(CowIndex),
@@ -252,6 +256,7 @@ impl<'a> ItemBody {
             ItemBody::MaybeEmphasis(..)
             | ItemBody::MaybeHtml
             | ItemBody::MaybeCode(..)
+            | ItemBody::MaybeMath(..)
             | ItemBody::MaybeLinkOpen
             | ItemBody::MaybeLinkClose
             | ItemBody::MaybeImage => true,
@@ -800,6 +805,17 @@ impl<'a> FirstPass<'a> {
                         start: ix,
                         end: ix + count,
                         body: ItemBody::MaybeCode(count, false),
+                    });
+                    begin_text = ix + count;
+                    LoopInstruction::ContinueAndSkip(count - 1)
+                }
+                b'$' => {
+                    self.tree.append_text(begin_text, ix);
+                    let count = 1 + scan_ch_repeat(&bytes[(ix + 1)..], b'$');
+                    self.tree.append(Item {
+                        start: ix,
+                        end: ix + count,
+                        body: ItemBody::MaybeMath(count, false),
                     });
                     begin_text = ix + count;
                     LoopInstruction::ContinueAndSkip(count - 1)
@@ -2097,6 +2113,52 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                ItemBody::MaybeMath(mut search_count, preceded_by_backslash) => {
+                    if preceded_by_backslash {
+                        search_count -= 1;
+                        if search_count == 0 {
+                            self.tree[cur_ix].item.body = ItemBody::Text;
+                            prev = cur;
+                            cur = self.tree[cur_ix].next;
+                            continue;
+                        }
+                    }
+
+                    if code_delims.is_populated() {
+                        // we have previously scanned all codeblock delimiters,
+                        // so we can reuse that work
+                        if let Some(scan_ix) = code_delims.find(cur_ix, search_count) {
+                            self.make_math_span(cur_ix, scan_ix, preceded_by_backslash);
+                        } else {
+                            self.tree[cur_ix].item.body = ItemBody::Text;
+                        }
+                    } else {
+                        // we haven't previously scanned all codeblock delimiters,
+                        // so walk the AST
+                        let mut scan = if search_count > 0 {
+                            self.tree[cur_ix].next
+                        } else {
+                            None
+                        };
+                        while let Some(scan_ix) = scan {
+                            if let ItemBody::MaybeMath(delim_count, _) =
+                                self.tree[scan_ix].item.body
+                            {
+                                if search_count == delim_count {
+                                    self.make_math_span(cur_ix, scan_ix, preceded_by_backslash);
+                                    code_delims.clear();
+                                    break;
+                                } else {
+                                    code_delims.insert(delim_count, scan_ix);
+                                }
+                            }
+                            scan = self.tree[scan_ix].next;
+                        }
+                        if scan == None {
+                            self.tree[cur_ix].item.body = ItemBody::Text;
+                        }
+                    }
+                }
                 ItemBody::MaybeLinkOpen => {
                     self.tree[cur_ix].item.body = ItemBody::Text;
                     self.link_stack.push(LinkStackEl {
@@ -2542,6 +2604,96 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Make a math span.
+    ///
+    /// Both `open` and `close` are matching MaybeMath items.
+    fn make_math_span(&mut self, open: TreeIndex, close: TreeIndex, preceding_backslash: bool) {
+        let first_ix = open + 1;
+        let last_ix = close - 1;
+        let bytes = self.text.as_bytes();
+        let mut span_start = self.tree[open].item.end;
+        let mut span_end = self.tree[close].item.start;
+        let mut buf: Option<String> = None;
+
+        // detect all-space sequences, since they are kept as-is as of commonmark 0.29
+        if !bytes[span_start..span_end].iter().all(|&b| b == b' ') {
+            let opening = match bytes[span_start] {
+                b' ' | b'\r' | b'\n' => true,
+                _ => false,
+            };
+            let closing = match bytes[span_end - 1] {
+                b' ' | b'\r' | b'\n' => true,
+                _ => false,
+            };
+            let drop_enclosing_whitespace = opening && closing;
+
+            if drop_enclosing_whitespace {
+                span_start += 1;
+                if span_start < span_end {
+                    span_end -= 1;
+                }
+            }
+
+            let mut ix = first_ix;
+
+            while ix < close {
+                if let ItemBody::HardBreak | ItemBody::SoftBreak = self.tree[ix].item.body {
+                    if drop_enclosing_whitespace {
+                        // check whether break should be ignored
+                        if ix == first_ix {
+                            ix = ix + 1;
+                            span_start = min(span_end, self.tree[ix].item.start);
+                            continue;
+                        } else if ix == last_ix && last_ix > first_ix {
+                            ix = ix + 1;
+                            continue;
+                        }
+                    }
+
+                    let end = bytes[self.tree[ix].item.start..]
+                        .iter()
+                        .position(|&b| b == b'\r' || b == b'\n')
+                        .unwrap()
+                        + self.tree[ix].item.start;
+                    if let Some(ref mut buf) = buf {
+                        buf.push_str(&self.text[self.tree[ix].item.start..end]);
+                        buf.push(' ');
+                    } else {
+                        let mut new_buf = String::with_capacity(span_end - span_start);
+                        new_buf.push_str(&self.text[span_start..end]);
+                        new_buf.push(' ');
+                        buf = Some(new_buf);
+                    }
+                } else if let Some(ref mut buf) = buf {
+                    let end = if ix == last_ix {
+                        span_end
+                    } else {
+                        self.tree[ix].item.end
+                    };
+                    buf.push_str(&self.text[self.tree[ix].item.start..end]);
+                }
+                ix = ix + 1;
+            }
+        }
+
+        let cow = if let Some(buf) = buf {
+            buf.into()
+        } else {
+            self.text[span_start..span_end].into()
+        };
+        if preceding_backslash {
+            self.tree[open].item.body = ItemBody::Text;
+            self.tree[open].item.end = self.tree[open].item.start + 1;
+            self.tree[open].next = Some(close);
+            self.tree[close].item.body = ItemBody::Math(self.allocs.allocate_cow(cow));
+            self.tree[close].item.start = self.tree[open].item.start + 1;
+        } else {
+            self.tree[open].item.body = ItemBody::Math(self.allocs.allocate_cow(cow));
+            self.tree[open].item.end = self.tree[close].item.end;
+            self.tree[open].next = self.tree[close].next;
+        }
+    }
+
     /// Returns the next byte offset on success.
     fn scan_inline_html(&mut self, bytes: &[u8], ix: usize) -> Option<usize> {
         let c = *bytes.get(ix)?;
@@ -2579,7 +2731,7 @@ pub(crate) enum LoopInstruction<T> {
 
 /// This function walks the byte slices from the given index and
 /// calls the callback function on all bytes (and their indices) that are in the following set:
-/// `` ` ``, `\`, `&`, `*`, `_`, `~`, `!`, `<`, `[`, `]`, `|`, `\r`, `\n`
+/// `` ` ``, `\`, `&`, `*`, `_`, `~`, `!`, `<`, `[`, `]`, `|`, `\r`, `\n`, `$`
 /// It is guaranteed not call the callback on other bytes.
 /// Whenever `callback(ix, byte)` returns a `ContinueAndSkip(n)` value, the callback
 /// will not be called with an index that is less than `ix + n + 1`.
@@ -2591,6 +2743,7 @@ fn iterate_special_bytes<F, T>(bytes: &[u8], ix: usize, callback: F) -> (usize, 
 where
     F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
 {
+    // TODO: support simd
     #[cfg(all(target_arch = "x86_64", feature = "simd"))]
     {
         crate::simd::iterate_special_bytes(bytes, ix, callback)
@@ -2616,6 +2769,7 @@ const fn special_bytes() -> [bool; 256] {
     bytes[b'\n' as usize] = true;
     bytes[b']' as usize] = true;
     bytes[b'&' as usize] = true;
+    bytes[b'$' as usize] = true;
     bytes
 }
 
@@ -2732,6 +2886,7 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &Allocations<'a>) -> Eve
     let tag = match item.body {
         ItemBody::Text => return Event::Text(text[item.start..item.end].into()),
         ItemBody::Code(cow_ix) => return Event::Code(allocs[cow_ix].clone()),
+        ItemBody::Math(cow_ix) => return Event::Math(allocs[cow_ix].clone()),
         ItemBody::SynthesizeText(cow_ix) => return Event::Text(allocs[cow_ix].clone()),
         ItemBody::Html => return Event::Html(text[item.start..item.end].into()),
         ItemBody::SoftBreak => return Event::SoftBreak,
@@ -3103,6 +3258,16 @@ mod test {
             assert_eq!(title.as_ref(), "SWAG");
         }
         assert!(link_tag_count > 0);
+    }
+
+    #[test]
+    fn inline_math_check() {
+        let test_str = "hello\n$a_i+a_j$";
+        let expected = "<p>hello\n<math>$a_i+a_j$</math></p>\n";
+
+        let mut buf = String::new();
+        crate::html::push_html(&mut buf, Parser::new(test_str));
+        assert_eq!(expected, buf);
     }
 
     #[test]

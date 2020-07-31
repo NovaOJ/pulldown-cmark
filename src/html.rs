@@ -160,6 +160,11 @@ where
                     escape_html(&mut self.writer, &text)?;
                     self.write("</code>")?;
                 }
+                Math(text) => {
+                    self.write("<math>$")?;
+                    escape_html(&mut self.writer, &text)?;
+                    self.write("$</math>")?;
+                }
                 Html(html) => {
                     self.write(&html)?;
                 }
@@ -424,7 +429,7 @@ where
                     }
                     nest -= 1;
                 }
-                Html(text) | Code(text) | Text(text) => {
+                Html(text) | Code(text) | Math(text) | Text(text) => {
                     escape_html(&mut self.writer, &text)?;
                     self.end_newline = text.ends_with('\n');
                 }
